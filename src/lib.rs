@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use anyhow::{Context, Result, bail};
+use indicatif::{ProgressBar, ProgressStyle};
 use serde::Serialize;
 use shakmaty::fen::Fen;
 use shakmaty::san::San;
@@ -48,8 +49,8 @@ pub struct MultipvRoot {
 pub struct MultipvLine {
     pub rank: usize,
     pub move_uci: String,
-    pub hero_score_cp: Option<i32>,
-    pub hero_mate_in: Option<i32>,
+    pub score_pawns: Option<f64>,
+    pub mate_in: Option<i32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -65,8 +66,8 @@ pub struct CandidateOutput {
 #[derive(Debug, Serialize)]
 pub struct EvalByDepth {
     pub depth: u32,
-    pub hero_score_cp: Option<i32>,
-    pub hero_mate_in: Option<i32>,
+    pub score_pawns: Option<f64>,
+    pub mate_in: Option<i32>,
     pub pv_uci: Vec<String>,
     pub pv_san: Vec<String>,
 }
@@ -74,9 +75,9 @@ pub struct EvalByDepth {
 #[derive(Debug, Serialize)]
 pub struct Stability {
     pub has_mate: bool,
-    pub range_cp: Option<i32>,
-    pub mean_cp: Option<f64>,
-    pub std_cp: Option<f64>,
+    pub range_pawns: Option<f64>,
+    pub mean_pawns: Option<f64>,
+    pub std_pawns: Option<f64>,
     pub pv_common_prefix_plies: usize,
     pub pv_stability_ratio: f64,
 }
@@ -128,19 +129,26 @@ pub fn analyze_fen(fen: &str, stockfish_path: &Path) -> Result<AnalyzerOutput> {
 
     let root_multipv = sf.analyze_root(fen, DEPTH_MAIN, MULTIPV_K)?;
     let mut candidates = Vec::new();
+    let progress = ProgressBar::new(legal_moves.len() as u64);
+    if let Ok(style) =
+        ProgressStyle::with_template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+    {
+        progress.set_style(style.progress_chars("##-"));
+    }
+    progress.set_message("analyzing legal moves");
 
     for mv in legal_moves.iter() {
         let move_uci = move_to_uci(mv)?;
         let mut eval_by_depth = Vec::new();
         for depth in DEPTHS_STABILITY {
             let data = sf.analyze_searchmove(fen, depth, &move_uci)?;
-            let (cp, mate) = normalize_score(hero, pos.turn(), data.cp, data.mate);
+            let (score_pawns, mate_in) = normalize_score_to_white(pos.turn(), data.cp, data.mate);
             let pv_uci = data.pv.into_iter().take(PV_MAX_PLIES).collect::<Vec<_>>();
             let pv_san = pv_to_san(&pos, &pv_uci)?;
             eval_by_depth.push(EvalByDepth {
                 depth,
-                hero_score_cp: cp,
-                hero_mate_in: mate,
+                score_pawns,
+                mate_in,
                 pv_uci,
                 pv_san,
             });
@@ -158,7 +166,9 @@ pub fn analyze_fen(fen: &str, stockfish_path: &Path) -> Result<AnalyzerOutput> {
             tactical_flags,
             pv_forcing_counts_first_12plies: forcing,
         });
+        progress.inc(1);
     }
+    progress.finish_with_message("analysis complete");
 
     Ok(AnalyzerOutput {
         schema_version: "1.0".to_string(),
@@ -177,12 +187,12 @@ pub fn analyze_fen(fen: &str, stockfish_path: &Path) -> Result<AnalyzerOutput> {
             lines: root_multipv
                 .into_iter()
                 .map(|l| {
-                    let (cp, mate) = normalize_score(hero, pos.turn(), l.cp, l.mate);
+                    let (score_pawns, mate_in) = normalize_score_to_white(pos.turn(), l.cp, l.mate);
                     MultipvLine {
                         rank: l.multipv,
                         move_uci: l.pv.first().cloned().unwrap_or_default(),
-                        hero_score_cp: cp,
-                        hero_mate_in: mate,
+                        score_pawns,
+                        mate_in,
                     }
                 })
                 .collect(),
@@ -191,16 +201,28 @@ pub fn analyze_fen(fen: &str, stockfish_path: &Path) -> Result<AnalyzerOutput> {
     })
 }
 
-fn normalize_score(
-    hero: Color,
+fn normalize_score_to_white(
     side_to_move_for_analysis: Color,
     cp: Option<i32>,
     mate: Option<i32>,
-) -> (Option<i32>, Option<i32>) {
-    let same = hero == side_to_move_for_analysis;
-    let cp = cp.map(|v| if same { v } else { -v });
-    let mate = mate.map(|v| if same { v } else { -v });
-    (cp, mate)
+) -> (Option<f64>, Option<i32>) {
+    let perspective = if side_to_move_for_analysis == Color::White {
+        1.0
+    } else {
+        -1.0
+    };
+    let mate_sign = if side_to_move_for_analysis == Color::White {
+        1
+    } else {
+        -1
+    };
+    let score_pawns = cp.map(|v| round_two_decimals((v as f64 / 100.0) * perspective));
+    let mate_in = mate.map(|v| v * mate_sign);
+    (score_pawns, mate_in)
+}
+
+fn round_two_decimals(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
 }
 
 fn tactical_flags(pos: &Chess, mv: &Move) -> Result<TacticalFlags> {
@@ -249,23 +271,27 @@ fn forcing_counts(pos: &Chess, eval: Option<&EvalByDepth>) -> ForcingCounts {
 fn compute_stability(eval_by_depth: &[EvalByDepth]) -> Stability {
     let cp_values = eval_by_depth
         .iter()
-        .filter_map(|e| e.hero_score_cp)
+        .filter_map(|e| e.score_pawns)
         .collect::<Vec<_>>();
-    let has_mate = eval_by_depth.iter().any(|e| e.hero_mate_in.is_some());
+    let has_mate = eval_by_depth.iter().any(|e| e.mate_in.is_some());
 
-    let (range_cp, mean_cp, std_cp) = if cp_values.len() >= 2 {
-        let min = *cp_values.iter().min().unwrap_or(&0);
-        let max = *cp_values.iter().max().unwrap_or(&0);
-        let mean = cp_values.iter().map(|v| *v as f64).sum::<f64>() / cp_values.len() as f64;
+    let (range_pawns, mean_pawns, std_pawns) = if cp_values.len() >= 2 {
+        let min = cp_values.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = cp_values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let mean = cp_values.iter().sum::<f64>() / cp_values.len() as f64;
         let var = cp_values
             .iter()
             .map(|v| {
-                let d = *v as f64 - mean;
+                let d = *v - mean;
                 d * d
             })
             .sum::<f64>()
             / cp_values.len() as f64;
-        (Some(max - min), Some(mean), Some(var.sqrt()))
+        (
+            Some(round_two_decimals(max - min)),
+            Some(round_two_decimals(mean)),
+            Some(round_two_decimals(var.sqrt())),
+        )
     } else {
         (None, None, None)
     };
@@ -289,9 +315,9 @@ fn compute_stability(eval_by_depth: &[EvalByDepth]) -> Stability {
 
     Stability {
         has_mate,
-        range_cp,
-        mean_cp,
-        std_cp,
+        range_pawns,
+        mean_pawns,
+        std_pawns,
         pv_common_prefix_plies: prefix,
         pv_stability_ratio: ratio,
     }
@@ -540,29 +566,29 @@ mod tests {
         let evals = vec![
             EvalByDepth {
                 depth: 12,
-                hero_score_cp: Some(10),
-                hero_mate_in: None,
+                score_pawns: Some(0.10),
+                mate_in: None,
                 pv_uci: vec!["e2e4".into()],
                 pv_san: vec![],
             },
             EvalByDepth {
                 depth: 16,
-                hero_score_cp: Some(30),
-                hero_mate_in: None,
+                score_pawns: Some(0.30),
+                mate_in: None,
                 pv_uci: vec!["e2e4".into()],
                 pv_san: vec![],
             },
             EvalByDepth {
                 depth: 20,
-                hero_score_cp: Some(20),
-                hero_mate_in: None,
+                score_pawns: Some(0.20),
+                mate_in: None,
                 pv_uci: vec!["e2e4".into()],
                 pv_san: vec![],
             },
         ];
         let s = compute_stability(&evals);
-        assert_eq!(s.range_cp, Some(20));
-        assert!((s.mean_cp.unwrap() - 20.0).abs() < 0.0001);
+        assert!((s.range_pawns.unwrap() - 0.20).abs() < 0.0001);
+        assert!((s.mean_pawns.unwrap() - 0.20).abs() < 0.0001);
     }
 
     #[test]

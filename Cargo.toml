@@ -9,6 +9,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 shakmaty = "0.27"
 clap = { version = "4", features = ["derive"] }
+indicatif = "0.18.4"
 
 [dev-dependencies]
 tempfile = "3"
